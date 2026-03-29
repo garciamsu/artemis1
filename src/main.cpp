@@ -1,11 +1,6 @@
 #include <Arduino.h>
 #include <SoftwareSerial.h>
-#include <Wire.h>
-#include <DHT.h>
-#include <Adafruit_Sensor.h>
-#include <Adafruit_TSL2591.h>
 #include <ctype.h>
-#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,7 +10,7 @@
 DIAGNOSTICO MODULAR DEL ROBOT 2WD POR BLUETOOTH
 ---------------------------------------------------------
 Objetivo:
-1) Consultar sensores individuales por comando
+1) Consultar sensores disponibles por comando
 2) Probar motores y maniobras simples por comando
 3) Mantener trazas claras por Bluetooth y monitor serial USB
 =========================================================
@@ -27,11 +22,6 @@ const byte HC05_TX_ARDUINO = 3;
 
 const byte FC51_DERECHO_PIN = 12;
 const byte FC51_IZQUIERDO_PIN = 13;
-
-const byte HCSR04_TRIG_PIN = 7;
-const byte HCSR04_ECHO_PIN = 8;
-
-const byte DHT22_PIN = A0;
 
 const byte MOTOR_DERECHO_ENA = 5;
 const byte MOTOR_DERECHO_IN1 = 11;
@@ -45,30 +35,49 @@ const long SERIAL_USB_BAUD = 9600;
 const long HC05_BAUD = 9600;
 
 const unsigned long ESPERA_INICIO_MS = 1200;
-const unsigned long ULTRASONICO_TIMEOUT_US = 30000;
 const byte TAMANO_BUFFER = 48;
 const byte VELOCIDAD_POR_DEFECTO = 150;
-
-const int GANANCIA_TSL = TSL2591_GAIN_MED;
-const int INTEGRACION_TSL = TSL2591_INTEGRATIONTIME_100MS;
+const byte VELOCIDAD_BAJA = 90;
+const byte VELOCIDAD_ALTA = 220;
+const byte VELOCIDAD_ABC_1 = 65;
+const byte VELOCIDAD_ABC_2 = 130;
+const byte VELOCIDAD_ABC_3 = 195;
+const byte VELOCIDAD_ABC_4 = 255;
+const byte DIVISOR_CURVA_SUAVE = 4;
+const unsigned long TIEMPO_MAXIMO_SIN_COMANDO_RAPIDO_MS = 350;
 
 enum FuenteComando {
     FUENTE_BLUETOOTH,
     FUENTE_USB
 };
 
+enum PerfilComandoRapido {
+    PERFIL_COMANDO_SIMPLE,
+    PERFIL_COMANDO_ARDUINO_BT_CONTROLLER
+};
+
+const PerfilComandoRapido PERFIL_COMANDO_INICIAL = PERFIL_COMANDO_ARDUINO_BT_CONTROLLER;
+
 SoftwareSerial bluetoothSerial(HC05_RX_ARDUINO, HC05_TX_ARDUINO);
-DHT dht(DHT22_PIN, DHT22);
-Adafruit_TSL2591 tsl = Adafruit_TSL2591(2591);
 
 char bluetoothBuffer[TAMANO_BUFFER + 1];
 char usbBuffer[TAMANO_BUFFER + 1];
 byte bluetoothIndex = 0;
 byte usbIndex = 0;
-bool tslDisponible = false;
+byte velocidadComandoRapido = VELOCIDAD_POR_DEFECTO;
+PerfilComandoRapido perfilComandoRapidoActivo = PERFIL_COMANDO_INICIAL;
+unsigned long ultimoComandoRapidoMs = 0;
+bool movimientoRapidoActivo = false;
+bool suprimirRespuestaBluetoothRapida = false;
+
+void detenerMotores();
 
 // ---------------- SALIDA Y TEXTO ----------------
 void responder(FuenteComando fuente, const char *mensaje) {
+
+    if (fuente == FUENTE_BLUETOOTH && suprimirRespuestaBluetoothRapida) {
+        return;
+    }
 
     if (fuente == FUENTE_BLUETOOTH) {
         bluetoothSerial.println(mensaje);
@@ -81,6 +90,10 @@ void responder(FuenteComando fuente, const char *mensaje) {
 }
 
 void responderFlash(FuenteComando fuente, const __FlashStringHelper *mensaje) {
+
+    if (fuente == FUENTE_BLUETOOTH && suprimirRespuestaBluetoothRapida) {
+        return;
+    }
 
     if (fuente == FUENTE_BLUETOOTH) {
         bluetoothSerial.println(mensaje);
@@ -125,6 +138,37 @@ void normalizarMensaje(const char *entrada, char *salida, byte tamanoSalida) {
     salida[indice] = '\0';
 }
 
+bool esComandoRapido(char caracter) {
+
+    switch (caracter) {
+        case '1':
+        case '2':
+        case '3':
+        case '4':
+        case 'F':
+        case 'B':
+        case 'U':
+        case 'u':
+        case 'N':
+        case 'L':
+        case 'R':
+        case 'X':
+        case 'G':
+        case 'H':
+        case 'D':
+        case 'E':
+        case 'C':
+        case 'I':
+        case 'J':
+        case 'K':
+        case 'S':
+        case 'Y':
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool leerLinea(Stream &puerto, char *buffer, byte &indiceActual) {
 
     while (puerto.available() > 0) {
@@ -132,6 +176,12 @@ bool leerLinea(Stream &puerto, char *buffer, byte &indiceActual) {
 
         if (caracter == '\r') {
             continue;
+        }
+
+        if (indiceActual == 0 && esComandoRapido(caracter)) {
+            buffer[0] = caracter;
+            buffer[1] = '\0';
+            return true;
         }
 
         if (caracter == '\n') {
@@ -158,6 +208,15 @@ const char *textoNivel(int valorDigital) {
     return valorDigital == HIGH ? "HIGH" : "LOW";
 }
 
+const char *nombrePerfilComandoRapido(PerfilComandoRapido perfil) {
+
+    if (perfil == PERFIL_COMANDO_ARDUINO_BT_CONTROLLER) {
+        return "arduino";
+    }
+
+    return "simple";
+}
+
 byte velocidadDesdeTexto(const char *texto) {
 
     if (texto == NULL || *texto == '\0') {
@@ -177,6 +236,60 @@ byte velocidadDesdeTexto(const char *texto) {
     return static_cast<byte>(valor);
 }
 
+void actualizarVelocidadComandoRapido(byte velocidad, FuenteComando fuente) {
+
+    velocidadComandoRapido = velocidad;
+
+    if (fuente == FUENTE_USB) {
+        char respuesta[48];
+        snprintf(respuesta, sizeof(respuesta), "Velocidad rapida=%u", velocidadComandoRapido);
+        responder(fuente, respuesta);
+    }
+    else {
+        Serial.print(F("Velocidad rapida="));
+        Serial.println(velocidadComandoRapido);
+    }
+}
+
+void registrarActividadComandoRapido(bool hayMovimiento, bool esStop, FuenteComando fuente) {
+
+    if (fuente != FUENTE_BLUETOOTH) {
+        return;
+    }
+
+    if (hayMovimiento) {
+        ultimoComandoRapidoMs = millis();
+        movimientoRapidoActivo = true;
+        return;
+    }
+
+    if (esStop) {
+        ultimoComandoRapidoMs = 0;
+        movimientoRapidoActivo = false;
+    }
+}
+
+void detenerMotoresPorInactividadBluetooth() {
+
+    if (!movimientoRapidoActivo) {
+        return;
+    }
+
+    if (ultimoComandoRapidoMs == 0) {
+        movimientoRapidoActivo = false;
+        return;
+    }
+
+    if (millis() - ultimoComandoRapidoMs < TIEMPO_MAXIMO_SIN_COMANDO_RAPIDO_MS) {
+        return;
+    }
+
+    detenerMotores();
+    movimientoRapidoActivo = false;
+    ultimoComandoRapidoMs = 0;
+    Serial.println(F("Auto-stop Bluetooth por inactividad"));
+}
+
 // ---------------- SENSORES ----------------
 void leerLineaResumen(char *salida, size_t tamanoSalida) {
 
@@ -192,97 +305,11 @@ void leerLineaResumen(char *salida, size_t tamanoSalida) {
     );
 }
 
-long leerDistanciaFrontalCm() {
-
-    digitalWrite(HCSR04_TRIG_PIN, LOW);
-    delayMicroseconds(2);
-
-    digitalWrite(HCSR04_TRIG_PIN, HIGH);
-    delayMicroseconds(10);
-    digitalWrite(HCSR04_TRIG_PIN, LOW);
-
-    long duracion = pulseIn(HCSR04_ECHO_PIN, HIGH, ULTRASONICO_TIMEOUT_US);
-
-    if (duracion == 0) {
-        return -1;
-    }
-
-    return duracion * 0.034 / 2;
-}
-
-void leerClimaResumen(char *salida, size_t tamanoSalida) {
-
-    float humedad = dht.readHumidity();
-    float temperatura = dht.readTemperature();
-
-    if (isnan(humedad) || isnan(temperatura)) {
-        snprintf(salida, tamanoSalida, "DHT22 sin lectura valida");
-        return;
-    }
-
-    int temperaturaDecimas = static_cast<int>(temperatura * 10.0f);
-    int humedadDecimas = static_cast<int>(humedad * 10.0f);
-
-    snprintf(
-        salida,
-        tamanoSalida,
-        "Clima T=%d.%dC H=%d.%d%%",
-        temperaturaDecimas / 10,
-        abs(temperaturaDecimas % 10),
-        humedadDecimas / 10,
-        abs(humedadDecimas % 10)
-    );
-}
-
-void leerLuzResumen(char *salida, size_t tamanoSalida) {
-
-    if (!tslDisponible) {
-        snprintf(salida, tamanoSalida, "TSL2591 no detectado");
-        return;
-    }
-
-    sensors_event_t evento;
-    tsl.getEvent(&evento);
-
-    if (evento.light == 0) {
-        uint32_t luminosidad = tsl.getFullLuminosity();
-        uint16_t infrarrojo = luminosidad >> 16;
-        uint16_t espectroCompleto = luminosidad & 0xFFFF;
-
-        snprintf(
-            salida,
-            tamanoSalida,
-            "Luz lux=0.0 full=%u ir=%u",
-            espectroCompleto,
-            infrarrojo
-        );
-        return;
-    }
-
-    int luxDecimas = static_cast<int>(evento.light * 10.0f);
-    snprintf(salida, tamanoSalida, "Luz lux=%d.%d", luxDecimas / 10, abs(luxDecimas % 10));
-}
-
 void responderResumenSensores(FuenteComando fuente) {
 
-    char respuesta[80];
+    char respuesta[48];
 
     leerLineaResumen(respuesta, sizeof(respuesta));
-    responder(fuente, respuesta);
-
-    long distancia = leerDistanciaFrontalCm();
-    if (distancia < 0) {
-        responderFlash(fuente, F("Distancia sin eco"));
-    }
-    else {
-        snprintf(respuesta, sizeof(respuesta), "Distancia %ld cm", distancia);
-        responder(fuente, respuesta);
-    }
-
-    leerClimaResumen(respuesta, sizeof(respuesta));
-    responder(fuente, respuesta);
-
-    leerLuzResumen(respuesta, sizeof(respuesta));
     responder(fuente, respuesta);
 }
 
@@ -300,8 +327,8 @@ void detenerMotores() {
 
 void moverMotorDerecho(bool adelante, byte velocidad) {
 
-    digitalWrite(MOTOR_DERECHO_IN1, adelante ? HIGH : LOW);
-    digitalWrite(MOTOR_DERECHO_IN2, adelante ? LOW : HIGH);
+    digitalWrite(MOTOR_DERECHO_IN1, adelante ? LOW : HIGH);
+    digitalWrite(MOTOR_DERECHO_IN2, adelante ? HIGH : LOW);
     analogWrite(MOTOR_DERECHO_ENA, velocidad);
 }
 
@@ -310,6 +337,17 @@ void moverMotorIzquierdo(bool adelante, byte velocidad) {
     digitalWrite(MOTOR_IZQUIERDO_IN3, adelante ? HIGH : LOW);
     digitalWrite(MOTOR_IZQUIERDO_IN4, adelante ? LOW : HIGH);
     analogWrite(MOTOR_IZQUIERDO_ENB, velocidad);
+}
+
+void moverMotoresDiferencial(
+    bool adelanteDerecho,
+    byte velocidadDerecha,
+    bool adelanteIzquierdo,
+    byte velocidadIzquierda
+) {
+
+    moverMotorDerecho(adelanteDerecho, velocidadDerecha);
+    moverMotorIzquierdo(adelanteIzquierdo, velocidadIzquierda);
 }
 
 void ejecutarMotorIndividual(bool esDerecho, const char *direccion, byte velocidad, FuenteComando fuente) {
@@ -356,11 +394,17 @@ void ejecutarMotores(const char *direccion, byte velocidad, FuenteComando fuente
 
     char respuesta[64];
 
+    if (strcmp(direccion, "stop") == 0) {
+        detenerMotores();
+        responderFlash(fuente, F("Motores detenidos"));
+        return;
+    }
+
     bool adelante = strcmp(direccion, "adelante") == 0;
     bool atras = strcmp(direccion, "atras") == 0;
 
     if (!adelante && !atras) {
-        responderFlash(fuente, F("Direccion invalida. Usa adelante o atras"));
+        responderFlash(fuente, F("Direccion invalida. Usa adelante, atras o stop"));
         return;
     }
 
@@ -394,22 +438,280 @@ void ejecutarGiro(const char *direccion, byte velocidad, FuenteComando fuente) {
     responderFlash(fuente, F("Direccion invalida. Usa izq o der"));
 }
 
+void ejecutarCurvaSuave(bool adelante, bool haciaIzquierda, byte velocidad, FuenteComando fuente) {
+
+    char respuesta[64];
+    byte velocidadInterior = velocidad / DIVISOR_CURVA_SUAVE;
+
+    if (haciaIzquierda) {
+        moverMotoresDiferencial(adelante, velocidad, adelante, velocidadInterior);
+        snprintf(
+            respuesta,
+            sizeof(respuesta),
+            "Curva %s izq vel=%u interior=%u",
+            adelante ? "adelante" : "atras",
+            velocidad,
+            velocidadInterior
+        );
+    }
+    else {
+        moverMotoresDiferencial(adelante, velocidadInterior, adelante, velocidad);
+        snprintf(
+            respuesta,
+            sizeof(respuesta),
+            "Curva %s der vel=%u interior=%u",
+            adelante ? "adelante" : "atras",
+            velocidad,
+            velocidadInterior
+        );
+    }
+
+    responder(fuente, respuesta);
+}
+
+bool procesarComandoRapidoSimple(char comando, FuenteComando fuente) {
+
+    switch (comando) {
+        case '1':
+            registrarActividadComandoRapido(false, false, fuente);
+            actualizarVelocidadComandoRapido(VELOCIDAD_BAJA, fuente);
+            return true;
+        case '2':
+            registrarActividadComandoRapido(false, false, fuente);
+            actualizarVelocidadComandoRapido(VELOCIDAD_POR_DEFECTO, fuente);
+            return true;
+        case '3':
+            registrarActividadComandoRapido(false, false, fuente);
+            actualizarVelocidadComandoRapido(VELOCIDAD_ALTA, fuente);
+            return true;
+        case 'U':
+            registrarActividadComandoRapido(true, false, fuente);
+            ejecutarMotores("adelante", velocidadComandoRapido, fuente);
+            return true;
+        case 'N':
+            registrarActividadComandoRapido(true, false, fuente);
+            ejecutarMotores("atras", velocidadComandoRapido, fuente);
+            return true;
+        case 'L':
+            registrarActividadComandoRapido(true, false, fuente);
+            ejecutarGiro("izq", velocidadComandoRapido, fuente);
+            return true;
+        case 'R':
+            registrarActividadComandoRapido(true, false, fuente);
+            ejecutarGiro("der", velocidadComandoRapido, fuente);
+            return true;
+        case 'X':
+            registrarActividadComandoRapido(false, true, fuente);
+            detenerMotores();
+            if (fuente == FUENTE_USB) {
+                responderFlash(fuente, F("Motores detenidos"));
+            }
+            return true;
+        case 'D':
+            registrarActividadComandoRapido(true, false, fuente);
+            ejecutarMotorIndividual(true, "adelante", velocidadComandoRapido, fuente);
+            return true;
+        case 'E':
+            registrarActividadComandoRapido(true, false, fuente);
+            ejecutarMotorIndividual(true, "atras", velocidadComandoRapido, fuente);
+            return true;
+        case 'C':
+            registrarActividadComandoRapido(false, true, fuente);
+            ejecutarMotorIndividual(true, "stop", velocidadComandoRapido, fuente);
+            return true;
+        case 'I':
+            registrarActividadComandoRapido(true, false, fuente);
+            ejecutarMotorIndividual(false, "adelante", velocidadComandoRapido, fuente);
+            return true;
+        case 'J':
+            registrarActividadComandoRapido(true, false, fuente);
+            ejecutarMotorIndividual(false, "atras", velocidadComandoRapido, fuente);
+            return true;
+        case 'K':
+            registrarActividadComandoRapido(false, true, fuente);
+            ejecutarMotorIndividual(false, "stop", velocidadComandoRapido, fuente);
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool procesarComandoRapidoArduinoBt(char comando, FuenteComando fuente) {
+
+    switch (comando) {
+        case '1':
+            registrarActividadComandoRapido(false, false, fuente);
+            actualizarVelocidadComandoRapido(VELOCIDAD_ABC_1, fuente);
+            return true;
+        case '2':
+            registrarActividadComandoRapido(false, false, fuente);
+            actualizarVelocidadComandoRapido(VELOCIDAD_ABC_2, fuente);
+            return true;
+        case '3':
+            registrarActividadComandoRapido(false, false, fuente);
+            actualizarVelocidadComandoRapido(VELOCIDAD_ABC_3, fuente);
+            return true;
+        case '4':
+            registrarActividadComandoRapido(false, false, fuente);
+            actualizarVelocidadComandoRapido(VELOCIDAD_ABC_4, fuente);
+            return true;
+        case 'F':
+            registrarActividadComandoRapido(true, false, fuente);
+            ejecutarMotores("adelante", velocidadComandoRapido, fuente);
+            return true;
+        case 'B':
+            registrarActividadComandoRapido(true, false, fuente);
+            ejecutarMotores("atras", velocidadComandoRapido, fuente);
+            return true;
+        case 'L':
+            registrarActividadComandoRapido(true, false, fuente);
+            ejecutarGiro("izq", velocidadComandoRapido, fuente);
+            return true;
+        case 'R':
+            registrarActividadComandoRapido(true, false, fuente);
+            ejecutarGiro("der", velocidadComandoRapido, fuente);
+            return true;
+        case 'G':
+            registrarActividadComandoRapido(true, false, fuente);
+            ejecutarCurvaSuave(true, true, velocidadComandoRapido, fuente);
+            return true;
+        case 'H':
+            registrarActividadComandoRapido(true, false, fuente);
+            ejecutarCurvaSuave(true, false, velocidadComandoRapido, fuente);
+            return true;
+        case 'I':
+            registrarActividadComandoRapido(true, false, fuente);
+            ejecutarCurvaSuave(false, true, velocidadComandoRapido, fuente);
+            return true;
+        case 'J':
+            registrarActividadComandoRapido(true, false, fuente);
+            ejecutarCurvaSuave(false, false, velocidadComandoRapido, fuente);
+            return true;
+        case 'S':
+            registrarActividadComandoRapido(false, true, fuente);
+            detenerMotores();
+            if (fuente == FUENTE_USB) {
+                responderFlash(fuente, F("Motores detenidos"));
+            }
+            return true;
+        case 'U':
+        case 'u':
+            registrarActividadComandoRapido(false, false, fuente);
+            if (fuente == FUENTE_USB) {
+                responderFlash(fuente, F("LED no configurado en este robot"));
+            }
+            else {
+                Serial.println(F("LED no configurado en este robot"));
+            }
+            return true;
+        case 'Y':
+            registrarActividadComandoRapido(false, false, fuente);
+            if (fuente == FUENTE_USB) {
+                responderFlash(fuente, F("Buzzer no configurado en este robot"));
+            }
+            else {
+                Serial.println(F("Buzzer no configurado en este robot"));
+            }
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool procesarComandoRapido(const char *mensajeOriginal, FuenteComando fuente) {
+
+    if (mensajeOriginal[0] == '\0' || mensajeOriginal[1] != '\0') {
+        return false;
+    }
+
+    char comando = mensajeOriginal[0];
+    bool resultado = false;
+
+    if (fuente == FUENTE_BLUETOOTH) {
+        suprimirRespuestaBluetoothRapida = true;
+    }
+
+    if (perfilComandoRapidoActivo == PERFIL_COMANDO_ARDUINO_BT_CONTROLLER) {
+        resultado = procesarComandoRapidoArduinoBt(comando, fuente);
+    }
+    else {
+        resultado = procesarComandoRapidoSimple(comando, fuente);
+    }
+
+    suprimirRespuestaBluetoothRapida = false;
+    return resultado;
+}
+
 // ---------------- COMANDOS ----------------
 void mostrarAyuda(FuenteComando fuente) {
 
-    responderFlash(fuente, F("Comandos: ayuda, estado, linea, dist, clima, luz, sensores, stop"));
+    responderFlash(fuente, F("Comandos: ayuda, estado, linea, sensores, stop"));
+    responderFlash(fuente, F("Perfil app: perfil arduino | perfil simple | perfil"));
     responderFlash(fuente, F("Motores: md adelante 120 | md atras 120 | md stop"));
     responderFlash(fuente, F("Motores: mi adelante 120 | mi atras 120 | mi stop"));
-    responderFlash(fuente, F("Motores: motores adelante 120 | motores atras 120"));
+    responderFlash(fuente, F("Motores: motores adelante 120 | motores atras 120 | motores stop"));
     responderFlash(fuente, F("Motores: giro izq 120 | giro der 120"));
+
+    if (perfilComandoRapidoActivo == PERFIL_COMANDO_ARDUINO_BT_CONTROLLER) {
+        responderFlash(fuente, F("Arduino BT: F/B avance, L/R giro, G/H/I/J curvas, S stop"));
+        responderFlash(fuente, F("Arduino BT: 1/2/3/4 velocidad, U/u LED, Y buzzer"));
+    }
+    else {
+        responderFlash(fuente, F("Simple: U adelante, N atras, L/R giro, X stop"));
+        responderFlash(fuente, F("Simple: D/E/C derecho, I/J/K izquierdo, 1/2/3 velocidad"));
+    }
 }
 
 void mostrarEstado(FuenteComando fuente) {
 
     responderFlash(fuente, F("Estado: diagnostico modular activo"));
     responderFlash(fuente, F("Bluetooth HC-05 9600, USB 9600"));
-    responderFlash(fuente, F("Linea FC-51 I=13 D=12, ultrasonico TRIG=7 ECHO=8"));
-    responderFlash(fuente, F("DHT22=A0, TSL2591 por I2C, L298N listo"));
+    responderFlash(fuente, F("Linea FC-51 I=13 D=12 disponibles"));
+    responderFlash(fuente, F("L298N derecho 5/11/10 e izquierdo 6/9/4 listos"));
+
+    char respuesta[48];
+    snprintf(respuesta, sizeof(respuesta), "Perfil app activo: %s", nombrePerfilComandoRapido(perfilComandoRapidoActivo));
+    responder(fuente, respuesta);
+}
+
+void procesarComandoPerfil(char *comando, FuenteComando fuente) {
+
+    char *token = strtok(comando, " ");
+    char *perfil = strtok(NULL, " ");
+
+    if (token == NULL || strcmp(token, "perfil") != 0) {
+        responderFlash(fuente, F("Comando de perfil invalido"));
+        return;
+    }
+
+    if (perfil == NULL) {
+        char respuesta[48];
+        snprintf(respuesta, sizeof(respuesta), "Perfil actual: %s", nombrePerfilComandoRapido(perfilComandoRapidoActivo));
+        responder(fuente, respuesta);
+        return;
+    }
+
+    if (
+        strcmp(perfil, "arduino") == 0 ||
+        strcmp(perfil, "abc") == 0 ||
+        strcmp(perfil, "controller") == 0
+    ) {
+        perfilComandoRapidoActivo = PERFIL_COMANDO_ARDUINO_BT_CONTROLLER;
+        velocidadComandoRapido = VELOCIDAD_ABC_4;
+        responderFlash(fuente, F("Perfil Arduino Bluetooth Controller activo"));
+        responderFlash(fuente, F("Velocidad inicial 4 = 255"));
+        return;
+    }
+
+    if (strcmp(perfil, "simple") == 0) {
+        perfilComandoRapidoActivo = PERFIL_COMANDO_SIMPLE;
+        velocidadComandoRapido = VELOCIDAD_POR_DEFECTO;
+        responderFlash(fuente, F("Perfil simple activo"));
+        responderFlash(fuente, F("Velocidad inicial 2 = 150"));
+        return;
+    }
+
+    responderFlash(fuente, F("Perfil invalido. Usa arduino o simple"));
 }
 
 void procesarComandoMotor(char *comando, FuenteComando fuente) {
@@ -465,9 +767,14 @@ void procesarComando(const char *mensajeOriginal, FuenteComando fuente) {
 
     char comandoEditable[TAMANO_BUFFER + 1];
     char comandoNormalizado[TAMANO_BUFFER + 1];
-    char respuesta[80];
+    char respuesta[48];
+
+    if (procesarComandoRapido(mensajeOriginal, fuente)) {
+        return;
+    }
 
     registrarEntrada(fuente, mensajeOriginal);
+
     normalizarMensaje(mensajeOriginal, comandoNormalizado, sizeof(comandoNormalizado));
 
     if (strcmp(comandoNormalizado, "hola") == 0) {
@@ -497,31 +804,6 @@ void procesarComando(const char *mensajeOriginal, FuenteComando fuente) {
         return;
     }
 
-    if (strcmp(comandoNormalizado, "dist") == 0 || strcmp(comandoNormalizado, "distancia") == 0) {
-        long distancia = leerDistanciaFrontalCm();
-
-        if (distancia < 0) {
-            responderFlash(fuente, F("Distancia sin eco"));
-        }
-        else {
-            snprintf(respuesta, sizeof(respuesta), "Distancia %ld cm", distancia);
-            responder(fuente, respuesta);
-        }
-        return;
-    }
-
-    if (strcmp(comandoNormalizado, "clima") == 0) {
-        leerClimaResumen(respuesta, sizeof(respuesta));
-        responder(fuente, respuesta);
-        return;
-    }
-
-    if (strcmp(comandoNormalizado, "luz") == 0) {
-        leerLuzResumen(respuesta, sizeof(respuesta));
-        responder(fuente, respuesta);
-        return;
-    }
-
     if (strcmp(comandoNormalizado, "sensores") == 0) {
         responderResumenSensores(fuente);
         return;
@@ -533,16 +815,29 @@ void procesarComando(const char *mensajeOriginal, FuenteComando fuente) {
         return;
     }
 
+    if (strcmp(comandoNormalizado, "perfil") == 0) {
+        strncpy(comandoEditable, comandoNormalizado, sizeof(comandoEditable) - 1);
+        comandoEditable[sizeof(comandoEditable) - 1] = '\0';
+        procesarComandoPerfil(comandoEditable, fuente);
+        return;
+    }
+
     strncpy(comandoEditable, comandoNormalizado, sizeof(comandoEditable) - 1);
     comandoEditable[sizeof(comandoEditable) - 1] = '\0';
 
     if (
+        strncmp(comandoEditable, "perfil", 6) == 0 ||
         strncmp(comandoEditable, "md ", 3) == 0 ||
         strncmp(comandoEditable, "mi ", 3) == 0 ||
         strncmp(comandoEditable, "motores ", 8) == 0 ||
         strncmp(comandoEditable, "giro ", 5) == 0
     ) {
-        procesarComandoMotor(comandoEditable, fuente);
+        if (strncmp(comandoEditable, "perfil", 6) == 0) {
+            procesarComandoPerfil(comandoEditable, fuente);
+        }
+        else {
+            procesarComandoMotor(comandoEditable, fuente);
+        }
         return;
     }
 
@@ -567,11 +862,6 @@ void configurarPinesSensores() {
 
     pinMode(FC51_DERECHO_PIN, INPUT);
     pinMode(FC51_IZQUIERDO_PIN, INPUT);
-
-    pinMode(HCSR04_TRIG_PIN, OUTPUT);
-    pinMode(HCSR04_ECHO_PIN, INPUT);
-
-    digitalWrite(HCSR04_TRIG_PIN, LOW);
 }
 
 void setup() {
@@ -582,19 +872,12 @@ void setup() {
     configurarPinesSensores();
     configurarPinesMotores();
 
-    dht.begin();
-    Wire.begin();
-
-    tslDisponible = tsl.begin();
-    if (tslDisponible) {
-        tsl.setGain(static_cast<tsl2591Gain_t>(GANANCIA_TSL));
-        tsl.setTiming(static_cast<tsl2591IntegrationTime_t>(INTEGRACION_TSL));
-    }
-
     delay(ESPERA_INICIO_MS);
 
     Serial.println(F("=== DIAGNOSTICO MODULAR ROBOT 2WD ==="));
-    Serial.println(F("App recomendada Android: Serial Bluetooth Terminal"));
+    Serial.println(F("Perfil inicial: Arduino Bluetooth Controller"));
+    Serial.println(F("Comandos Arduino BT: F B L R G H I J S 1 2 3 4"));
+    Serial.println(F("Cambia con: perfil arduino | perfil simple"));
     Serial.println(F("Configura envio con fin de linea LF o CR+LF"));
     Serial.println(F("Escribe ayuda para ver los comandos"));
     Serial.println();
@@ -605,6 +888,8 @@ void setup() {
 
 // ---------------- BUCLE PRINCIPAL ----------------
 void loop() {
+
+    detenerMotoresPorInactividadBluetooth();
 
     if (leerLinea(bluetoothSerial, bluetoothBuffer, bluetoothIndex)) {
         procesarComando(bluetoothBuffer, FUENTE_BLUETOOTH);
