@@ -43,8 +43,9 @@ const byte TAMANO_BUFFER = 48;
 const byte VELOCIDAD_POR_DEFECTO = 120;
 const byte VELOCIDAD_BAJA = 100;
 const byte VELOCIDAD_ALTA = 160;
-const byte VELOCIDAD_REMOTEXY_MAX = 120;
-const byte JOYSTICK_ZONA_MUERTA = 12;
+const byte VELOCIDAD_REMOTEXY_MIN = 100;
+const byte VELOCIDAD_REMOTEXY_MAX = 254;
+const byte JOYSTICK_ZONA_MUERTA = 5;
 
 enum FuenteComando {
     FUENTE_BLUETOOTH,
@@ -64,12 +65,13 @@ const ModoAppBluetooth MODO_APP_BLUETOOTH_ACTIVO = MODO_APP_REMOTEXY;
 
 #pragma pack(push, 1)
 uint8_t const PROGMEM RemoteXY_CONF_PROGMEM[] =
-    {255, 2, 0, 0, 0, 30, 0, 19, 0, 0, 0, 65, 114, 116, 101, 109, 105, 115, 49, 0,
-     27, 1, 106, 200, 1, 1, 1, 0, 5, 22, 12, 60, 60, 32, 2, 26, 31};
+    {255, 3, 0, 0, 0, 30, 0, 19, 0, 0, 0, 0, 28, 1, 106, 200, 1, 1, 2, 0,
+     5, 22, 12, 60, 60, 32, 2, 26, 31, 4, 46, 142, 17, 50, 32, 36, 26};
 
 struct {
     int8_t joystick_01_x;
     int8_t joystick_01_y;
+    int8_t Velocidad;
     uint8_t connect_flag;
 } RemoteXY;
 #pragma pack(pop)
@@ -90,6 +92,7 @@ unsigned long ultimoRearmeRemoteXYMs = 0;
 bool movimientoRapidoActivo = false;
 bool suprimirRespuestaBluetoothRapida = false;
 bool remotexyConectadoPrevio = false;
+byte velocidadRemoteXYActual = VELOCIDAD_REMOTEXY_MIN;
 
 void detenerMotores();
 
@@ -465,6 +468,20 @@ byte escalarVelocidadDesdePorcentaje(int porcentaje, byte velocidadMaxima) {
     return static_cast<byte>(velocidad);
 }
 
+byte velocidadRemoteXYDesdeSlider(int valorSlider) {
+
+    int valorLimitado = constrain(valorSlider, -100, 100);
+    long velocidad = map(valorLimitado, -100, 100, VELOCIDAD_REMOTEXY_MIN, VELOCIDAD_REMOTEXY_MAX);
+    return static_cast<byte>(velocidad);
+}
+
+byte calcularVelocidadInterior(byte velocidadBase, int intensidadGiro) {
+
+    int giroLimitado = constrain(intensidadGiro, 0, 100);
+    long velocidad = map(giroLimitado, 0, 100, velocidadBase, 0);
+    return static_cast<byte>(velocidad);
+}
+
 int aplicarZonaMuertaJoystick(int valor) {
 
     int valorAbsoluto = valor < 0 ? -valor : valor;
@@ -480,20 +497,37 @@ void ejecutarJoystickRemoteXY(int ejeX, int ejeY) {
 
     int giro = aplicarZonaMuertaJoystick(ejeX);
     int avance = aplicarZonaMuertaJoystick(ejeY);
-    int potenciaIzquierda = constrain(avance + giro, -100, 100);
-    int potenciaDerecha = constrain(avance - giro, -100, 100);
+    int giroAbsoluto = giro < 0 ? -giro : giro;
+    int avanceAbsoluto = avance < 0 ? -avance : avance;
+    velocidadRemoteXYActual = velocidadRemoteXYDesdeSlider(RemoteXY.Velocidad);
 
-    if (potenciaIzquierda == 0 && potenciaDerecha == 0) {
+    if (giro == 0 && avance == 0) {
         detenerMotores();
         return;
     }
 
-    moverMotoresDiferencial(
-        potenciaDerecha >= 0,
-        escalarVelocidadDesdePorcentaje(potenciaDerecha, VELOCIDAD_REMOTEXY_MAX),
-        potenciaIzquierda >= 0,
-        escalarVelocidadDesdePorcentaje(potenciaIzquierda, VELOCIDAD_REMOTEXY_MAX)
-    );
+    if (avance == 0) {
+        bool giroDerecha = giro > 0;
+        moverMotoresDiferencial(!giroDerecha, velocidadRemoteXYActual, giroDerecha, velocidadRemoteXYActual);
+        return;
+    }
+
+    bool adelante = avance > 0;
+
+    if (giro == 0 || giroAbsoluto <= avanceAbsoluto) {
+        moverMotoresDiferencial(adelante, velocidadRemoteXYActual, adelante, velocidadRemoteXYActual);
+        return;
+    }
+
+    int intensidadGiro = map(giroAbsoluto, avanceAbsoluto, 100, 0, 100);
+    byte velocidadInterior = calcularVelocidadInterior(velocidadRemoteXYActual, intensidadGiro);
+
+    if (giro > 0) {
+        moverMotoresDiferencial(adelante, velocidadInterior, adelante, velocidadRemoteXYActual);
+        return;
+    }
+
+    moverMotoresDiferencial(adelante, velocidadRemoteXYActual, adelante, velocidadInterior);
 }
 
 void registrarCambioConexionRemoteXY(bool conectado) {
@@ -542,6 +576,8 @@ void configurarRemoteXY() {
     gui->addConnection(bluetoothSerial);
     bluetoothSerial.listen();
 
+    RemoteXY.Velocidad = -100;
+    velocidadRemoteXYActual = VELOCIDAD_REMOTEXY_MIN;
     remotexyConectadoPrevio = false;
     ultimoRearmeRemoteXYMs = millis();
 }
@@ -680,6 +716,16 @@ void mostrarEstado(FuenteComando fuente) {
             sizeof(respuesta),
             "RemoteXY conectado=%s velMax=%u",
             remotexyConectadoPrevio ? "si" : "no",
+            VELOCIDAD_REMOTEXY_MAX
+        );
+        responder(fuente, respuesta);
+
+        snprintf(
+            respuesta,
+            sizeof(respuesta),
+            "Velocidad slider=%u rango=%u-%u",
+            velocidadRemoteXYActual,
+            VELOCIDAD_REMOTEXY_MIN,
             VELOCIDAD_REMOTEXY_MAX
         );
         responder(fuente, respuesta);
@@ -858,7 +904,7 @@ void setup() {
 
     if (MODO_APP_BLUETOOTH_ACTIVO == MODO_APP_REMOTEXY) {
         Serial.println(F("Bluetooth dedicado a RemoteXY"));
-        Serial.println(F("RemoteXY usa joystick con zona muerta y auto-stop de seguridad"));
+        Serial.println(F("RemoteXY usa joystick con slider 100-254 y giro filtrado desde 45 grados"));
         Serial.println(F("USB mantiene comandos de diagnostico"));
     }
     else {
