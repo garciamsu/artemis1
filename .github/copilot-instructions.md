@@ -14,10 +14,14 @@
 - El proyecto usa PlatformIO con Arduino Uno. `platformio.ini` es la fuente de verdad para board, framework y puerto serial.
 - La lógica principal vive en `src/main.cpp` mientras el proyecto siga siendo un sketch único.
 - El hardware actual conocido es:
-  - buzzer en pin 7
-  - motor vibrador PWM en pin 6
-  - sensor frontal HC-SR04 en pines 8/9
-  - sensor de suelo HC-SR04 en pines 10/11
+  - HC-05 en pines 2/3 con divisor resistivo hacia `RXD` del módulo
+  - FC-51 derecho en pin 12
+  - FC-51 izquierdo en pin 13
+  - HC-SR04 frontal en pines 7/8
+  - DHT22 en `A0`
+  - TSL2591 por bus I2C (`SDA`/`SCL`)
+  - L298N con motor derecho en `ENA=5`, `IN1=11`, `IN2=10`
+  - L298N con motor izquierdo en `ENB=6`, `IN3=9`, `IN4=4`
 - Aún no existe una lógica final cerrada. El desarrollo debe avanzar por módulos independientes y pruebas incrementales antes de consolidar el comportamiento global.
 - Si el sketch crece, separar primero por responsabilidad y no por complejidad artificial:
   - lectura de sensores
@@ -37,6 +41,7 @@
 - Preferir cambios en `platformio.ini` antes que editar archivos generados dentro de `.vscode/`.
 - Mantener manejo defensivo de lecturas inválidas. En el código actual, `pulseIn()` con timeout devuelve `-1` cuando no hay eco; no eliminar esa protección sin reemplazo equivalente.
 - Diseñar cada módulo para que sus entradas y salidas sean explícitas. Evitar dependencias ocultas y estados globales innecesarios.
+- Cuando cambie el cableado físico, actualizar primero este archivo y luego el firmware para evitar mezclar mapas de pines viejos con el inventario activo del robot.
 - Antes de integrar lógica nueva en `loop()`, validar el módulo de forma aislada con una rutina simple, salida serial y criterios de aceptación concretos.
 - Favorecer simplicidad sobre sofisticación: primero que funcione y sea medible, luego refinar.
 - Tener presente las limitaciones del Arduino Uno: RAM reducida, CPU limitada, temporización bloqueante con `delay()` y PWM del motor en pin 6.
@@ -75,12 +80,11 @@
 - No asumir que un módulo funciona igual que otro similar sin confirmación del usuario o evidencia de prueba.
 
 ## Registro De Módulos
-- `Lectura HC-SR04`: propósito actual medir distancia en cm con timeout defensivo. Entradas: `trigPin`, `echoPin`. Salida: distancia o `-1`. Estado: en prueba.
-- `Sensor frontal`: propósito actual detectar obstáculos al frente. Hardware: HC-SR04 en 8/9. Estado: en prueba.
-- `Sensor de suelo`: propósito actual detectar cambios de distancia al piso o posibles desniveles. Hardware: HC-SR04 en 10/11. Estado: en prueba.
-- `Buzzer`: propósito actual emitir alerta auditiva. Hardware: pin 7. Estado: en prueba.
-- `Motor vibrador`: propósito actual emitir alerta háptica por PWM. Hardware: pin 6. Estado: en prueba.
-- `Alerta fuerte`: propósito actual patrón de emergencia para alto riesgo. Dependencias: buzzer y motor. Estado: prototipo actual, no asumir definitivo.
-- `Alerta media`: propósito actual patrón moderado para obstáculo frontal. Dependencias: buzzer y motor. Estado: prototipo actual, no asumir definitivo.
-- `Diagnóstico serial`: propósito actual mostrar mediciones en monitor serial a 9600 baudios. Estado: en prueba.
-- `Lógica de prioridad`: existe un prototipo donde el desnivel tiene prioridad sobre obstáculo frontal, pero debe tratarse como referencia temporal hasta validar el comportamiento final.
+- `Bluetooth HC-05`: propósito actual validar comunicación serial bidireccional y servir como canal de comandos de prueba para el robot 2WD. Entradas: texto recibido por Bluetooth y por monitor serial USB. Salidas: respuestas por Bluetooth y trazas por serial USB. Dependencias de hardware: HC-05 en modo esclavo. Pinout usado en la prueba: `TXD HC-05 -> pin 2 Arduino`, `pin 3 Arduino -> divisor resistivo 2k/1k -> RXD HC-05`, `VCC -> 5V`, `GND -> GND`, `STATE` y `KEY` desconectados. Estado: validado en enlace básico. Hallazgos relevantes: módulo nuevo de fábrica, PIN de emparejamiento validado con `1234`, comunicación de texto confirmada con Android usando `Serial Bluetooth Terminal`, velocidad de trabajo actual `9600`. Procedimiento mínimo: revisar cableado y divisor resistivo, abrir monitor serial a `9600`, enlazar Android, configurar envío con fin de línea `LF` o `CR+LF`, enviar `hola`, `ayuda`, `ping` y `estado`, verificar eco y respuestas en ambos sentidos.
+- `FC-51 derecho`: propósito actual detectar línea o contraste en el lado derecho del robot. Entradas: `OUT=12`. Salidas: nivel digital. Dependencias de hardware: sensor infrarrojo FC-51, `5V`, `GND` común. Pinout usado en la prueba: sensor derecho montado hacia el piso. Estado: identificado, calibración pendiente. Hallazgos relevantes: altura declarada `25 mm`, separación entre centros `45 mm`, objetivo final seguimiento de línea negra de `17 mm` sobre cartulina blanca mate. El potenciómetro de al menos un sensor fue tocado previamente y la polaridad negro/blanco aún no está validada. Procedimiento mínimo: consultar lectura digital por Bluetooth o serial, probar negro y blanco manualmente, registrar si el sensor entrega `HIGH` o `LOW` sobre cada superficie antes de integrar control.
+- `FC-51 izquierdo`: propósito actual detectar línea o contraste en el lado izquierdo del robot. Entradas: `OUT=13`. Salidas: nivel digital. Dependencias de hardware: sensor infrarrojo FC-51, `5V`, `GND` común. Pinout usado en la prueba: sensor izquierdo montado hacia el piso. Estado: identificado, calibración pendiente. Hallazgos relevantes: comparte la misma geometría y limitaciones del sensor derecho; la altura actual de `25 mm` probablemente sea exigente para seguimiento fiable y debe validarse con pruebas reales antes de asumir funcionamiento correcto. Procedimiento mínimo: consultar lectura digital por Bluetooth o serial, probar negro y blanco manualmente y comparar con el sensor derecho.
+- `HC-SR04 frontal`: propósito actual medir distancia al frente del robot. Entradas: `TRIG=7`, `ECHO=8`. Salidas: distancia en cm o lectura inválida si no hay eco. Dependencias de hardware: `5V`, `GND` común. Pinout usado en la prueba: sensor montado fijo mirando hacia adelante. Estado: identificado; prueba específica pendiente.
+- `DHT22`: propósito actual medir temperatura y humedad ambiente. Entradas: `DATA=A0`. Salidas: temperatura y humedad. Dependencias de hardware: módulo con pull-up integrada, `5V`, `GND` común. Pinout usado en la prueba: `DATA` al pin analógico `A0`. Estado: identificado; lectura pendiente.
+- `Adafruit TSL2591`: propósito actual medir luz ambiente por I2C. Entradas: `SDA=SDA`, `SCL=SCL`. Salidas: lectura de luminosidad y canales internos según librería. Dependencias de hardware: `5V`, `GND` común, `3Vo` e `INT` desconectados. Pinout usado en la prueba: conectado directamente al bus I2C del Arduino Uno sin otros módulos I2C activos por ahora. Estado: identificado; lectura pendiente.
+- `L298N motor derecho`: propósito actual controlar el motor derecho del robot 2WD. Entradas: `ENA=5`, `IN1=11`, `IN2=10`. Salidas: giro adelante, atrás y velocidad PWM. Dependencias de hardware: driver L298N, batería externa, `GND` común. Estado: identificado; prueba de sentido y velocidad pendiente.
+- `L298N motor izquierdo`: propósito actual controlar el motor izquierdo del robot 2WD. Entradas: `ENB=6`, `IN3=9`, `IN4=4`. Salidas: giro adelante, atrás y velocidad PWM. Dependencias de hardware: driver L298N, batería externa, `GND` común. Estado: identificado; prueba de sentido y velocidad pendiente.
