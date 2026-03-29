@@ -36,14 +36,15 @@ const long HC05_BAUD = 9600;
 
 const unsigned long ESPERA_INICIO_MS = 1200;
 const byte TAMANO_BUFFER = 48;
-const byte VELOCIDAD_POR_DEFECTO = 150;
-const byte VELOCIDAD_BAJA = 90;
-const byte VELOCIDAD_ALTA = 220;
-const byte VELOCIDAD_ABC_1 = 65;
-const byte VELOCIDAD_ABC_2 = 130;
-const byte VELOCIDAD_ABC_3 = 195;
-const byte VELOCIDAD_ABC_4 = 255;
+const byte VELOCIDAD_POR_DEFECTO = 120;
+const byte VELOCIDAD_BAJA = 100;
+const byte VELOCIDAD_ALTA = 160;
+const byte VELOCIDAD_ABC_1 = 100;
+const byte VELOCIDAD_ABC_2 = 120;
+const byte VELOCIDAD_ABC_3 = 140;
+const byte VELOCIDAD_ABC_4 = 160;
 const byte DIVISOR_CURVA_SUAVE = 4;
+const byte VELOCIDAD_MINIMA_CURVA = 80;
 const unsigned long TIEMPO_MAXIMO_SIN_COMANDO_RAPIDO_MS = 350;
 
 enum FuenteComando {
@@ -251,6 +252,25 @@ void actualizarVelocidadComandoRapido(byte velocidad, FuenteComando fuente) {
     }
 }
 
+byte calcularVelocidadInteriorCurva(byte velocidadExterior) {
+
+    byte velocidadInterior = velocidadExterior / DIVISOR_CURVA_SUAVE;
+
+    if (velocidadInterior == 0) {
+        return 0;
+    }
+
+    if (velocidadInterior < VELOCIDAD_MINIMA_CURVA) {
+        velocidadInterior = VELOCIDAD_MINIMA_CURVA;
+    }
+
+    if (velocidadInterior > velocidadExterior) {
+        velocidadInterior = velocidadExterior;
+    }
+
+    return velocidadInterior;
+}
+
 void registrarActividadComandoRapido(bool hayMovimiento, bool esStop, FuenteComando fuente) {
 
     if (fuente != FUENTE_BLUETOOTH) {
@@ -441,7 +461,7 @@ void ejecutarGiro(const char *direccion, byte velocidad, FuenteComando fuente) {
 void ejecutarCurvaSuave(bool adelante, bool haciaIzquierda, byte velocidad, FuenteComando fuente) {
 
     char respuesta[64];
-    byte velocidadInterior = velocidad / DIVISOR_CURVA_SUAVE;
+    byte velocidadInterior = calcularVelocidadInteriorCurva(velocidad);
 
     if (haciaIzquierda) {
         moverMotoresDiferencial(adelante, velocidad, adelante, velocidadInterior);
@@ -697,9 +717,9 @@ void procesarComandoPerfil(char *comando, FuenteComando fuente) {
         strcmp(perfil, "controller") == 0
     ) {
         perfilComandoRapidoActivo = PERFIL_COMANDO_ARDUINO_BT_CONTROLLER;
-        velocidadComandoRapido = VELOCIDAD_ABC_4;
+        velocidadComandoRapido = VELOCIDAD_ABC_2;
         responderFlash(fuente, F("Perfil Arduino Bluetooth Controller activo"));
-        responderFlash(fuente, F("Velocidad inicial 4 = 255"));
+        responderFlash(fuente, F("Velocidad inicial 2 = 120"));
         return;
     }
 
